@@ -1,0 +1,78 @@
+# ADR-0002: 마스터 코드 조회를 메모리 캐시 + 기동 시 워밍업으로 전환
+
+- Status: Accepted
+- Date: 2026-05-04
+- Deciders: 김예인
+- Tags: #performance #spring #cache #cold-start
+
+## Context
+- 사내 SaaS의 검색·문서 화면에서 자주 노출되는 마스터 코드(생산기관 등)를 매 요청마다 DB에서 조회하고 있었음
+- 데이터 변경 빈도는 매우 낮은 마스터급(분기 단위 변경)이었음에도 매 요청 풀스캔 비용을 그대로 지불하고 있었음
+
+- 실측 결과 73건 조회에 약 1.7초가 소요됨.
+  - `selectTitleDepts` 964 ms (73건 반환)
+  - `countTitleDepts` 716 ms (1건 COUNT)
+  - 합계 약 1,680 ms
+
+- 원인 분석: 마스터 코드 뷰가 자음 분류를 위해 CASE 식의 결과를 IN 비교에 사용하고 있어 매 요청마다 풀스캔(select + count 각 1회)을 수행하고 인덱스를 한 번도 타지 못하는 구조였음. (레거시 DB는 인덱스가 존재하지도 않았다..)
+
+- 추가 문제: HPA(Horizontal Pod Autoscaler) 환경에서 Pod이 새로 뜨면 첫 사용자가 콜드 스타트 비용을 그대로 부담함. 트래픽이 늘어 Pod이 자주 추가될수록 이 비용이 누적적으로 사용자 체감 지연이 됨.
+
+## Decision
+1. 마스터 코드를 Caffeine 기반 로컬 캐시에 적재하고, 자음/키워드 필터링은 DB가 아닌 백엔드 메모리에서 수행한다.
+2. 콜드 스타트 비용을 첫 사용자에게 전가하지 않기 위해, 애플리케이션 기동 직후 `ApplicationReadyEvent` 시점에 `getAll()`을 1회 호출하는 **별도 워밍업 리스너 빈**(`*CacheWarmupListener`)을 둔다.
+3. 워밍업 책임은 캐시 서비스(`*CacheService`)와 분리한다. 같은 빈  내부에서 호출하면 Spring AOP의 self-invocation 제약 때문에 프록시가 우회되어 `@Cacheable`이 동작하지 않기 때문(아래 Alternatives B 참조).
+4. 워밍업 실패는 애플리케이션 기동을 막지 않고 WARN 로그만 남긴다. (DB 일시 장애 시 첫 요청 시점에 자연 재시도되어 캐시가 채워짐)
+
+## Alternatives Considered
+- **A안 (선택됨): 전체 캐시 + 메모리 필터 + 기동 시 워밍업**
+  - 장점: 캐시 hit 시 응답 sub-ms, 마스터 데이터 특성과 잘 맞고 콜드 스타트 비용 제거
+  - 단점: 마스터 데이터가 매우 커지면 메모리/기동 시간 증가 가능, 캐시 갱신 정책 필요
+
+- **B안: 캐시 서비스 내부에서 `@PostConstruct`로 self-invocation 워밍업**
+  - 장점: 빈을 새로 만들지 않아 구조가 단순
+  - 단점: Spring AOP가 같은 빈 내부 호출 시 프록시를 거치지 않는 self-invocation 제약으로 `@Cacheable`이 동작하지 않음. 실제로 시도해 캐시가 적재되지 않는 것을 확인하고 폐기.
+
+- **C안: count + select 쿼리 통합 + 정렬 최적화 (SQL 튜닝)**
+  - 장점: 캐시 도입 없이 빠르게 적용 가능
+  - 단점: 측정상 약 1.7s → 1.0s로 **절반 단축에 그침**. 매 요청 풀스캔 1회는 유지되므로 트래픽 증가 시 그대로 부하가 됨.
+
+- **D안: 워밍업 없이 캐시만 도입**
+  - 장점: 코드량 최소
+  - 단점: HPA 환경에서 Pod이 추가될 때마다 첫 사용자가 콜드 스타트 비용부담. P99 지연 악화.
+
+## Consequences
+- ✅ **마스터 코드 조회 응답시간 약 1,680 ms → 1 ms 미만으로 단축 (캐시 hit 기준, 약 1,700배)**
+  - Before: `select 964ms + count 716ms` = 약 1,680 ms
+  - After: 메모리 캐시 hit으로 sub-ms
+- ✅ DB 부하: 매 요청 풀스캔 2회 → 워밍업/캐시 갱신 주기당 1회로 감소
+- ✅ 첫 사용자가 부담하던 콜드 스타트 비용도 워밍업으로 제거
+- ✅ AOP self-invocation이라는 프레임워크 제약을 코드 구조로 명시화하여, 다른 개발자가 같은 함정에 빠지지 않도록 책임 분리(Javadoc에 사유 명시). 동일 패턴을 다른 캐시(`TaxInfoCacheService` ↔ `PrecedentRulingService`) 에도 일관 적용.
+- ⚠️ 마스터 데이터가 매우 커지면 기동 시간/메모리가 증가. 현재는 73~수백 건 수준이라 무시 가능하지만, **사이즈/워밍업 시간 모니터링은 아직 미설치**.
+- ⚠️ 워밍업 실패가 WARN 로그로만 남고, 별도 알림(알람 룰)이 연결되어 있지않음. 캐시가 비어있는 상태로 운영되어도 즉시 인지하기 어려움.
+- ⚠️ `@ConditionalOnProperty`로 워밍업을 ON/OFF 토글하는 옵션을 아직 넣지 않아, 운영 중 일시적으로 워밍업을 끄려면 코드 변경 + 재배포가 필요.
+- 🔮 재검토 트리거:
+  - 마스터 데이터가 N건(예: 10만 건) 이상으로 늘거나
+  - 워밍업 자체가 5초 이상 걸리거나
+  - 다중 Pod 간 캐시 일관성 요구(쓰기 즉시 반영)가 생기면
+  → 비동기 워밍업, Lazy + 백그라운드 리프레시, 또는 Redis 등 외부 캐시(L1+L2 2-Tier) 도입을 검토.
+
+## Lessons Learned
+- 처음에는 SQL 튜닝으로 해결할 수 있을 거라고 봤지만, select와 count 시간을 나눠서 측정해보니 단순 쿼리 문제가 아니라 매 요청마다 풀스캔이 발생하는 구조 자체가 병목이었음. 쿼리 통합만으로는 약 1.7초에서 1.0초 수준까지밖에 줄지 않았고, 결국 마스터 데이터 특성상 캐시로 전환하는 것이 더 적절하다고 판단함. 어떤 성능 이슈든 **"측정으로 단계 분리 → 진단 → 트레이드오프 표 → 선택"** 의 순서를 깨지 않는 것이 중요함을 체감함
+- **Spring AOP self-invocation 제약**을 코드로 직접 부딪혀 본 경험이 결정적이었음. 처음에는 `@PostConstruct`로 self-invocation 시도 → 캐시가 채워지지 않는 것을 확인 → 원인 파악(프록시 우회) → 빈 분리로 해결. 이 함정은 "한 번 빠지면 잊을 수 없는" 종류라서 같은 패턴을 다른 캐시에도 즉시 적용했고, Javadoc에 사유를 명시 둠.
+- **캐시 적용 자체는 효과가 컸지만, 운영 관점의 보완 작업은 아직 남아 있음.** 핵심 동작(캐시 hit < 1ms)에 만족해 모니터링 알람·토글·사이즈 메트릭을 후순위로 미뤘는데, 캐시가 비어있어도 즉시 알 방법이 없는 상태가 운영 리스크로 남아있음(아래 TODO).
+
+## TODO
+- [ ] 워밍업 시간/캐시 사이즈를 메트릭으로 노출 (Actuator + 추후 Prometheus)
+- [ ] 워밍업 실패 시 알람 룰 연결 (현재는 WARN 로그만)
+- [ ] `@ConditionalOnProperty`로 워밍업 ON/OFF 토글 추가(`matchIfMissing = true`로 기본 ON, 운영 중 토글 가능)
+- [ ] 캐시 만료/갱신 정책 명시화 (현재 정책을 README/Javadoc에 정리)
+
+## References
+- 코드: `TitleDeptCacheWarmupListener.java`, `TitleDeptCacheService.java`
+- 동일 패턴 적용 사례: `TaxInfoCacheService` ↔ `PrecedentRulingService`
+  의 빈 분리
+- 외부:
+  - Spring Framework Reference — "Understanding AOP Proxies"
+  - Spring Boot Reference — "ApplicationReadyEvent"
+  - Caffeine Cache GitHub Wiki
