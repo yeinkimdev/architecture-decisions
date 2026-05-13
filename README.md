@@ -14,19 +14,13 @@
 
 | ID | 제목 | Status | Date | Tags |
 |---|---|---|---|---|
-| [ADR-0001](./adr/0001-사내-공통-스타터-라이브러리-도입.md) | 사내 공통 기능을 Spring Boot Starter 형태의 멀티 모듈 라이브러리로 제공 | Accepted | 2024-XX | `#platform` `#standardization` |
-| [ADR-0002](./adr/0002-마이크로서비스-도메인-경계-분리.md) | 단일 Spring 모놀리식을 9개 마이크로서비스로 분리 | Accepted | 2024-XX | `#msa` `#ddd` |
-| [ADR-0003](./adr/0003-gateway-jwt-통합-처리.md) | Gateway에서 JWT 인증/인가를 통합 처리 | Superseded by ADR-0005 | 2024-XX | `#security` `#gateway` |
-| [ADR-0004](./adr/0004-인증-인가-필터-분리.md) | 인증 필터와 인가 필터를 분리 | Accepted | 2024-XX | `#security` `#gateway` |
-| [ADR-0005](./adr/0005-인증을-별도-idp-서비스로-분리.md) | SSO 요구를 위해 인증을 별도 IdP 서비스로 분리 | Accepted | 2025-XX | `#security` `#identity` `#sso` |
-| [ADR-0006](./adr/0006-kustomize-argocd-app-of-apps.md) | Kustomize + ArgoCD App-of-Apps GitOps 채택 | Accepted | 2025-XX | `#devops` `#gitops` `#k8s` |
-| [ADR-0007](./adr/0007-마스터-코드-캐시-워밍업.md) | 마스터 코드 캐시 워밍업을 별도 빈으로 분리 | Accepted | 2026-05 | `#performance` `#spring` `#cache` |
+
 
 ## 결정 궤적 (시각화)
 
 > 어떤 결정이 어떤 결정으로 이어졌는지
 
-\`\`\`mermaid
+```mermaid
 graph TD
   ADR3[ADR-0003: Gateway 통합 인증]
   ADR4[ADR-0004: 인증·인가 필터 분리]
@@ -34,7 +28,7 @@ graph TD
   ADR3 -.refined by.-> ADR4
   ADR3 -.superseded by.-> ADR5
   ADR4 -.builds on.-> ADR5
-\`\`\`
+```
 
 ## 사용한 템플릿
 [template.md](./template.md) — MADR-lite 기반
